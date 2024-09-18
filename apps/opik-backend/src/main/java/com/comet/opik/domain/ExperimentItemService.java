@@ -1,9 +1,15 @@
 package com.comet.opik.domain;
 
+import com.comet.opik.api.Experiment;
 import com.comet.opik.api.ExperimentItem;
+import com.comet.opik.api.ExperimentItemStreamRequest;
 import com.comet.opik.infrastructure.auth.RequestContext;
+import com.comet.opik.utils.JsonUtils;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.google.common.base.Preconditions;
+import io.dropwizard.jersey.errors.ErrorMessage;
 import jakarta.inject.Inject;
+import jakarta.inject.Provider;
 import jakarta.inject.Singleton;
 import jakarta.ws.rs.ClientErrorException;
 import jakarta.ws.rs.NotFoundException;
@@ -12,10 +18,16 @@ import lombok.NonNull;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.collections4.CollectionUtils;
+import org.glassfish.jersey.server.ChunkedOutput;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 
 @Singleton
@@ -26,6 +38,7 @@ public class ExperimentItemService {
     private final @NonNull ExperimentItemDAO experimentItemDAO;
     private final @NonNull ExperimentService experimentService;
     private final @NonNull DatasetItemDAO datasetItemDAO;
+    private final @NonNull Provider<RequestContext> requestContext;
 
     public Mono<Void> create(Set<ExperimentItem> experimentItems) {
         Preconditions.checkArgument(CollectionUtils.isNotEmpty(experimentItems),
@@ -116,6 +129,58 @@ public class ExperimentItemService {
         return new NotFoundException(message);
     }
 
+    public ChunkedOutput<JsonNode> getExperimentItemsStream(@NonNull ExperimentItemStreamRequest request) {
+        var outputStream = new ChunkedOutput<JsonNode>(JsonNode.class, "\r\n");
+        var workspaceId = requestContext.get().getWorkspaceId();
+        var userName = requestContext.get().getUserName();
+        var workspaceName = requestContext.get().getWorkspaceName();
+        log.info("Getting experiment items stream by '{}', workspaceId '{}'", request, workspaceId);
+        Schedulers.boundedElastic()
+                .schedule(() -> Mono
+                        .fromCallable(() -> experimentService.findByName(request.experimentName()))
+                        .subscribeOn(Schedulers.boundedElastic())
+                        .flatMap(experiments -> experiments.map(Experiment::id).collect(Collectors.toUnmodifiableSet()))
+                        .flatMapMany(
+                                experimentIds -> experimentItemDAO.getItems(
+                                        experimentIds, request.limit(), request.lastRetrievedId()))
+                        .doOnNext(item -> sendItem(item, outputStream))
+                        .onErrorResume(throwable -> handleError(throwable, outputStream))
+                        .doFinally(signalType -> close(outputStream))
+                        .contextWrite(ctx -> ctx.put(RequestContext.USER_NAME, userName)
+                                .put(RequestContext.WORKSPACE_NAME, workspaceName)
+                                .put(RequestContext.WORKSPACE_ID, workspaceId))
+                        .subscribe());
+        log.info("Got experiment items stream by '{}', workspaceId '{}'", request, workspaceId);
+        return outputStream;
+    }
+
+    private void sendItem(ExperimentItem item, ChunkedOutput<JsonNode> outputStream) {
+        try {
+            outputStream.write(JsonUtils.readTree(item));
+        } catch (IOException exception) {
+            throw new UncheckedIOException(exception);
+        }
+    }
+
+    private Flux<ExperimentItem> handleError(Throwable throwable, ChunkedOutput<JsonNode> outputStream) {
+        if (throwable instanceof TimeoutException) {
+            try {
+                outputStream.write(JsonUtils.readTree(new ErrorMessage(500, "Streaming operation timed out")));
+            } catch (IOException ioException) {
+                log.error("Failed to stream error to client", ioException);
+            }
+        }
+        return Flux.error(throwable);
+    }
+
+    private void close(ChunkedOutput<JsonNode> outputStream) {
+        try {
+            outputStream.close();
+        } catch (IOException exception) {
+            log.error("Error while closing experiment items stream", exception);
+        }
+    }
+
     public Mono<Void> delete(@NonNull Set<UUID> ids) {
         Preconditions.checkArgument(CollectionUtils.isNotEmpty(ids),
                 "Argument 'ids' must not be empty");
@@ -123,5 +188,4 @@ public class ExperimentItemService {
         log.info("Deleting experiment items, count '{}'", ids.size());
         return experimentItemDAO.delete(ids).then();
     }
-
 }

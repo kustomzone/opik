@@ -83,6 +83,19 @@ class ExperimentItemDAO {
             ;
             """;
 
+    private static final String STREAM = """
+            SELECT
+                *
+            FROM experiment_items
+            WHERE experiment_id IN :experiment_ids
+            AND workspace_id = :workspace_id
+            <if(lastRetrievedId)> AND id \\< :lastRetrievedId <endif>
+            ORDER BY id DESC, last_updated_at DESC
+            LIMIT 1 BY id
+            LIMIT :limit
+            ;
+            """;
+
     private static final String DELETE = """
             DELETE FROM experiment_items
             WHERE id IN :ids
@@ -198,6 +211,29 @@ class ExperimentItemDAO {
         Statement statement = connection.createStatement(SELECT)
                 .bind("id", id);
 
+        return makeFluxContextAware(bindWorkspaceIdToFlux(statement));
+    }
+
+    public Flux<ExperimentItem> getItems(Set<UUID> experimentIds, int limit, UUID lastRetrievedId) {
+        return Mono.from(connectionFactory.create())
+                .flatMapMany(connection -> getItems(experimentIds, limit, lastRetrievedId, connection))
+                .flatMap(this::mapToExperimentItem);
+    }
+
+    private Publisher<? extends Result> getItems(
+            Set<UUID> experimentIds, int limit, UUID lastRetrievedId, Connection connection) {
+        log.info("Streaming experiment items by experimentIds count '{}', limit '{}', lastRetrievedId '{}'",
+                experimentIds.size(), limit, lastRetrievedId);
+        var template = new ST(STREAM);
+        if (lastRetrievedId != null) {
+            template.add("lastRetrievedId", lastRetrievedId);
+        }
+        var statement = connection.createStatement(template.render())
+                .bind("experiment_ids", experimentIds.toArray(UUID[]::new))
+                .bind("limit", limit);
+        if (lastRetrievedId != null) {
+            statement.bind("lastRetrievedId", lastRetrievedId);
+        }
         return makeFluxContextAware(bindWorkspaceIdToFlux(statement));
     }
 
